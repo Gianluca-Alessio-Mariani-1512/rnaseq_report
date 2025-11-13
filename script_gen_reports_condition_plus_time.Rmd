@@ -1,0 +1,341 @@
+---
+title: "Bulk RNAseq report"
+output:
+  workflowr::wflow_html:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Gianluca Alessio Mariani"
+
+params:
+  input_samples_table: "WRITE_INPUT_PATH_HERE"
+  input_main_template: "./txt_templates/_template_main.txt"
+  input_singlecomp_template: "./txt_templates/_template_singlecomp.txt"
+  output_folder_rmd: "WRITE_OUTPUT_PATH_HERE"
+---
+
+```{r}
+knitr::opts_chunk$set(echo       = FALSE,
+                      message    = FALSE,
+                      warning    = FALSE,
+                      cache      = FALSE,
+                      autodep    = TRUE,
+                      fig.align  = 'center',
+                      fig.width  = 10,
+                      fig.height = 8)
+```
+
+```{r load_lib}
+library(dplyr)
+library(rlang)
+library(glue)
+library(knitr)
+```
+
+```{r function}
+gen_comparison <- function(samples_df,
+                           comp_id,
+                           contrast_variable,
+                           other_design_variables = NULL,
+                           e_filter,
+                           c_filter,
+                           e_descr = NULL,
+                           c_descr = NULL,
+                           exclude = NULL) {
+  
+  comp_descr <- paste(e_descr, "vs", c_descr)
+  e_descr <- paste(e_descr, "(exp)")
+  c_descr <- paste(c_descr, "(contr)")
+
+  if (!(contrast_variable %in% names(e_filter))) {
+    stop(paste("contrast_variable", contrast_variable, "not found in e_filter"))
+  }
+  if (!(contrast_variable %in% names(c_filter))) {
+    stop(paste("contrast_variable", contrast_variable, "not found in c_filter"))
+  }
+
+  e_contrast_value <- e_filter[[contrast_variable]]
+  c_contrast_value <- c_filter[[contrast_variable]]
+
+  if (length(e_contrast_value) != 1 || length(c_contrast_value) != 1) {
+    stop("contrast_variable must have only one values both in e_filter and in c_filter")
+  }
+
+  e_samples <- samples_df
+  for (filter_name in names(e_filter)) {
+    e_samples <- e_samples %>% filter(.data[[filter_name]] %in% e_filter[[filter_name]])
+  }
+
+  c_samples <- samples_df
+  for (filter_name in names(c_filter)) {
+    c_samples <- c_samples %>% filter(.data[[filter_name]] %in% c_filter[[filter_name]])
+  }
+
+  comp_df <- bind_rows(
+    e_samples %>% mutate(comparison_ID = comp_id, sample_type = "e"),
+    c_samples %>% mutate(comparison_ID = comp_id, sample_type = "c")
+  ) %>%
+    dplyr::select(comparison_ID, sample_type, sample)
+
+  if (!is.null(exclude)) {
+    comp_df <- comp_df %>% filter(!(sample %in% exclude))
+  }
+
+  return(list(
+    comparison_df = comp_df,
+    comp_id = comp_id,
+    comp_descr = comp_descr,
+    contrast_variable = contrast_variable,
+    e_contrast_value = e_contrast_value,
+    c_contrast_value = c_contrast_value,
+    other_design_variables = other_design_variables,
+    e_descr = e_descr,
+    c_descr = c_descr
+  ))
+}
+```
+
+```{r init}
+sample_info <- read.csv(params$input_samples_table, stringsAsFactors = FALSE)
+main_rmd <- readLines(params$input_main_template)
+singlecomp_rmd <- readLines(params$input_singlecomp_template)
+```
+
+# Instructions
+
+Add to chunk_code_1 the list of comparisons you want to generate by copying and pasting the template below
+Modify:
+- contrast_variable: the variable to use for contrast (e.g. condition, time, etc), it must be present as a column name in the sample_info dataframe
+- other_design_variables: other variables to include in the design (can be NULL), used to correct for batch effects or other covariates
+- e_filter: a named list of filters to select experimental samples, the names and values must match column names and column values in sample_info dataframe and must include the names specified in contrast_variable and other_design_variables
+- c_filter: same as e_filter but for control samples
+- e_descr: description for experimental samples, used in report texts (choose freely, it is for your personal use)
+- c_descr: same as e_descr but for control samples
+- exclude: optional, a vector of sample names to exclude from the comparison (can be NULL)
+- report_filename: the name of the Rmd report file to generate for this comparison
+
+(template to copy and paste, ignore the triple quotes):
+"""
+comp_id <- comp_id + 1
+comp_list[[length(comp_list) + 1]] <- gen_comparison(
+  samples_df = sample_info,
+  comp_id = comp_id,
+  exclude = NULL,
+  
+  contrast_variable = 'condition_single',
+  other_design_variables = NULL,
+
+  e_filter = list(condition_single = 'shIFI6_1_Day1'),
+  c_filter = list(condition_single = 'shSCR_Day1'),
+  
+  e_descr = 'shIFI6_1 Day1',
+  c_descr = 'shSCR Day1',
+)
+comp_list[[length(comp_list)]]$report_filename <- '02_de_ifi6_sh1_day1.Rmd'
+"""
+
+```{r generate_comparisons_text, results='asis', echo = FALSE}
+
+chunk_code_1 <- "
+comp_id <- 0
+comp_list <- list()
+
+############################################################################### shIFI6_1_vs_scramble_at_day_X
+
+comp_id <- comp_id + 1
+comp_list[[length(comp_list) + 1]] <- gen_comparison(
+  samples_df = sample_info,
+  comp_id = comp_id,
+  
+  contrast_variable = 'condition_single',
+  e_filter = list(condition_single = 'shIFI6_1_Day1'),
+  c_filter = list(condition_single = 'shSCR_Day1'),
+  
+  e_descr = 'shIFI6_1 Day1',
+  c_descr = 'shSCR Day1',
+)
+comp_list[[length(comp_list)]]$report_filename <- '02_de_ifi6_sh1_day1.Rmd'
+"
+
+chunk_code_2 <- "
+##### Generate_list_of_comparisons
+
+text_deseq_groups <- ''
+
+if (length(comp_list) > 0) {
+  for (comp in comp_list) {
+    
+    comp_df <- comp$comparison_df
+    
+    # Sample names
+    exp_samples <- comp_df %>%
+      filter(sample_type == 'e') %>%
+      pull(sample)
+    
+    ctrl_samples <- comp_df %>%
+      filter(sample_type == 'c') %>%
+      pull(sample)
+    
+    # Descriptions
+    comp_id <- comp$comp_id
+    comp_descr <- comp$comp_descr
+    e_descr <- comp$e_descr
+    c_descr <- comp$c_descr
+    
+    # Comparison text
+    comparison_text <- paste0('(', e_descr, ' vs ', c_descr, ')')
+    
+    text_deseq_groups <- paste0(text_deseq_groups,
+      '\\n',
+      '➤ Comparison ', comp_id, ', ', comp_descr, '\\n',
+      '\\n\\t- **\"Treatment\" samples** (', e_descr, ', e):\\n',
+      paste0('\\t\\t', exp_samples, collapse = '\\n'), '\\n',
+      '\\n\\t- **Control samples** (', c_descr, ', c):\\n',
+      paste0('\\t\\t', ctrl_samples, collapse = '\\n'), '\\n\\n'
+    )
+  }
+} else {
+  text_deseq_groups <- '⚠️ No valid group defined for DGE analysis.\\n'
+}
+
+text_html <- gsub('\\n', '<br>', text_deseq_groups)
+text_html <- gsub('\\t', '&nbsp;&nbsp;&nbsp;&nbsp;', text_html)
+cat(text_html)
+"
+```
+
+```{r generate_and_run_final_chunk}
+final_chunk <- (paste0("```{r generate_comparisons, results='asis', echo = FALSE}\n", chunk_code_1, chunk_code_2, "\n```\n"))
+
+eval(parse(text = chunk_code_1))
+```
+
+```{r main_yaml}
+main_yaml <- glue('
+---
+title: "Bulk RNAseq report"
+output:
+  workflowr::wflow_html:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+date: "`r format(Sys.time(), \'%d %B, %Y\')`"
+author: "Gianluca Alessio Mariani"
+
+params:
+  sample_info_file: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/data/samples_list.csv"
+  utils_file: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/src/__utils_rna_seq_functions.R"
+  dds_file: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/data/deseq2.dds.RData"
+  ribosomal_genes_file: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/src/genes2filter_symbol.csv"
+  min_sample: 10
+  logfc: 1
+  qvalue: 0.05
+  genelist1: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/data/UNIQUELIST_shIFI6_vs_shIFI6.csv"
+  genelist2: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/data/UNIQUELIST_shIFI6_vs_shSCR.csv"
+  gene_name_type: "SYMBOL"
+---
+')
+```
+
+```{r main_rmd}
+final_chunk_lines <- strsplit(final_chunk, "\n")[[1]]
+pos <- grep("{__sub__}", main_rmd, fixed = TRUE)
+
+main_rmd <- c(
+  main_rmd[1:(pos-1)],
+  final_chunk_lines,
+  main_rmd[(pos+1):length(main_rmd)]
+)
+
+final_rmd <- c(main_yaml, "", main_rmd)
+
+writeLines(final_rmd, file.path(params$output_folder_rmd, "01_baseline_analysis.Rmd"))
+```
+
+```{r singlecomp_yaml}
+singlecomp_yaml_list <- list()
+
+for (i in seq_along(comp_list)) {
+  df <- comp_list[[i]]$comparison_df
+  exp_samples <- df$sample[df$sample_type == "e"]
+  ctrl_samples <- df$sample[df$sample_type == "c"]
+  e_descr <- comp_list[[i]]$e_descr
+  c_descr <- comp_list[[i]]$c_descr
+  comp_descr <- comp_list[[i]]$comp_descr
+  contrast_variable <- comp_list[[i]]$contrast_variable
+  e_contrast_value <- comp_list[[i]]$e_contrast_value
+  c_contrast_value <- comp_list[[i]]$c_contrast_value
+  design_vars <- c(contrast_variable, comp_list[[i]]$other_design_variables)
+
+  # Converti i sample in YAML-friendly lista
+  exp_yaml <- paste0("        - \"", exp_samples, "\"", collapse = "\n")
+  ctrl_yaml <- paste0("        - \"", ctrl_samples, "\"", collapse = "\n")
+  e_descr_yaml <- paste0("      e_descr: \"", e_descr, "\"")
+  c_descr_yaml <- paste0("      c_descr: \"", c_descr, "\"")
+  comp_descr_yaml <- paste0("  comp_descr: \"", comp_descr, "\"")
+  design_vars_yaml <- paste0("    - \"", design_vars, "\"", collapse = "\n")
+  contrast_variable_yaml <- paste0("  contrast_variable: \"", contrast_variable, "\"")
+  e_contrast_value_yaml <- paste0("  e_contrast_value: \"", e_contrast_value, "\"")
+  c_contrast_value_yaml <- paste0("  c_contrast_value: \"", c_contrast_value, "\"")
+  
+singlecomp_yaml <- glue('
+---
+output:
+  workflowr::wflow_html:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+date: "`r format(Sys.time(), \'%d %B, %Y\')`"
+author: "Gianluca Alessio Mariani"
+
+params:
+  design_vars: 
+{design_vars_yaml}
+{contrast_variable_yaml}
+{e_contrast_value_yaml}
+{c_contrast_value_yaml}
+  num_samples: 23
+  num_replicates: 2
+  batch_effect: null
+  logfc: 1
+  gsea_terms: 15
+  qvalue: 0.05
+  gsea_pval2filter_GO: 0.05
+  gsea_pval2filter_HALLMARK: 0.05
+  path_option: ""
+  top_n_genes_used4ora: 1000
+  gene_name_type: "symbol"
+  sample_info_file: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/data/sample_list_variables.csv"
+  utils_file: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/src/__utils_rna_seq_functions.R"
+  dds_file: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/data/deseq2.dds.RData" 
+  ribosomal_genes_file: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/src/genes2filter_symbol.csv"
+  hallmark_file: "/hpcnfs/scratch/DIMA/gmariani/PROJECTS/rna/reports/projects/frascolla/frascolla_chemoresistance/src/h.all.v2025.1.Hs.symbols.gmt"
+{comp_descr_yaml}
+  exp:
+    value:
+{e_descr_yaml}
+      exp_samples:
+{exp_yaml}
+  contr:
+    value:
+{c_descr_yaml}
+      ctrl_samples:
+{ctrl_yaml}
+---
+')
+  
+  singlecomp_yaml_list[[i]] <- singlecomp_yaml
+}
+```
+
+```{r singlecomp_rmd}
+for (i in seq_along(comp_list)) {
+ final_singlecomp_rmd <- c(singlecomp_yaml_list[[i]], "", singlecomp_rmd)
+
+ writeLines(final_singlecomp_rmd, file.path(params$output_folder_rmd, comp_list[[i]]$report_filename)) 
+}
+```

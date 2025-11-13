@@ -1,0 +1,664 @@
+```{r}
+knitr::opts_chunk$set(echo       = FALSE,
+                      message    = FALSE,
+                      warning    = FALSE,
+                      cache      = FALSE,
+                      autodep    = TRUE,
+                      fig.align  = 'center',
+                      fig.width  = 10,
+                      fig.height = 8)
+```
+
+```{r parameters}
+min_sample = params$min_sample
+logfc=params$logfc
+qvalue=params$qvalue
+rdata_file=params$dds_file
+```
+
+## Introduction
+
+FRASCOLLA AGGIUNGI
+
+### Overview of the analysis steps
+
+1) Quality control of raw data with [FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/)
+2) Adapter and quality trimming with [Trim Galore!](https://www.bioinformatics.babraham.ac.uk/projects/trim_galore/)
+3) Read alignment with [STAR](https://github.com/alexdobin/STAR).
+4) Estimation of transcript and gene expression with [Salmon](https://combine-lab.github.io/salmon/).
+5) Differential gene expression analysis with [DESeq2](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html) (v1.49.1)
+6) Gene set enrichment analysis with [ClusterProfiler](https://bioconductor.org/packages/release/bioc/html/clusterProfiler.html) (v4.17.0)
+
+The steps from 1 to 4 have been performed using [nf-core/rnaseq](https://nf-co.re/rnaseq) v3.18.0.
+This report includes analysis from step 5 and 6
+
+```{r libraries}
+source(params$utils_file)
+
+# LIBRARY
+if (!require("DT")) install.packages('DT')
+if (!require("git2r")) install.packages("git2r")
+if (!require("reshape2")) install.packages("reshape2")
+
+library(glue)
+library("DESeq2")
+library(rtracklayer)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(gplots) 
+library(ggplot2)
+library("DT")
+library(reshape)
+library(plotly)
+library(clusterProfiler)
+library(dplyr)
+library(WGCNA)
+library(gridExtra)
+library("git2r")
+library(limma)
+library(tibble)
+library(AnnotationDbi)
+library("org.Hs.eg.db")
+library(msigdbr)
+library(ReactomePA)
+```
+
+## Samples Datatable
+
+Below we present the table containing all the samples analyzed in this report.  
+
+Each sample is described by:
+
+  - sample: sample name defined a priori in the previous step of RNA seq analysis
+
+  - sample_description: a descriptive version of the sample name to improve clarity in the presentation of data
+
+  - batch: the experimental batch of each sample
+
+  - condition: the treatment condition (control, knockdown, treated, etc...)
+
+  - condition_description: a descriptive version of the condition to improve clarity in the presentation of data
+  
+  - time: day after treatment
+
+```{r load_samples, results="asis"}
+
+# Get information
+sample_info <- read.csv(params$sample_info_file, header = TRUE)
+rownames(sample_info) <- sample_info$sample
+
+# Convert to factors
+sample_info[] <- lapply(sample_info, as.factor)
+
+datatable(
+   sample_info,
+   extensions = 'Buttons',   
+   options = list(     
+        dom = 'Blfrtip',     
+        buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),     
+        lengthMenu = list(c(10, 25, 50, -1),                       
+        c(10, 25, 50, "All"))   
+        ),   
+    rownames = FALSE )
+```
+
+## Comparisons definition
+
+The comparisons included in the report are listed below. 
+Each comparison group includes two subsets of samples: a 'treatment' group and a control group. 
+Differential gene expression analysis is conducted by comparing the 'treatment' samples to the control samples within each group.
+
+{__sub__}
+
+```{r load_data_deseq, results="asis"}
+# Load DESeq2 object containing raw count data
+dds <- myload_filter_ribo(rdata_file,
+  filter_ribo = TRUE, 
+  ribo_file = params$ribosomal_genes_file
+)
+
+# Clean names
+sample_info$sample <- make.names(sample_info$sample)
+rownames(sample_info) <- sample_info$sample
+
+# Get common samples
+common_samples <- intersect(colnames(dds), sample_info$sample)
+dds <- dds[, common_samples]
+sample_info <- sample_info[common_samples, ]
+
+# sanity check
+stopifnot(all(colnames(dds) == rownames(sample_info)))
+
+colData(dds)$sample <- sample_info$sample
+colData(dds)$condition <- sample_info$condition
+
+# possible design variables
+design_vars <- c("batch", "condition", "time")  
+
+# Remove constant
+constant_vars <- check_constant_vars(sample_info, design_vars)
+if (length(constant_vars) > 0) {
+  message("Constant variable removed: ", paste(constant_vars, collapse = ", "))
+}
+valid_vars <- setdiff(design_vars, constant_vars)
+if (length(valid_vars) == 0) {
+  stop("No variable for design. condition column is missing or it contains a single condition.")
+}
+
+# Remove missing design variables
+missing_vars = valid_vars[!(valid_vars %in% colnames(sample_info))]
+if (length(missing_vars) > 0) {
+  message("IMPORTANT!!!! missing variable removed: ", paste(missing_vars, collapse = ", "))
+}
+valid_vars <- setdiff(valid_vars, missing_vars)
+if (length(valid_vars) == 0) {
+  stop("No variable for design. condition column is missing or it contains a single condition.")
+}
+
+design_formula <- as.formula(
+  paste("~", paste(valid_vars, collapse = " + "))
+)
+```
+
+```{r deseq2_allsamples}
+counts <- assay(dds)
+min_reads <- round(ncol(counts) / 2)
+min_sample <- length(unique(sample_info$condition))
+
+out_deseq2 <- mydeseq2(
+  counts = counts,
+  min_reads = min_reads,
+  sample_info = sample_info,
+  min_sample = min_sample,
+  design_formula = design_formula,
+  gene_name_type = params$gene_name_type
+)
+  
+genet <- my_genetable(
+  res = out_deseq2$res, 
+  title_1vs2 = "All_genes", 
+  qvalue = params$qvalue, 
+  logfc = params$logfc,
+  path_option = params$path_option
+)
+
+allgenes <- genet[["res"]]
+deg <- genet[["deg"]]
+```
+
+## PCA Analysis
+
+For the PCA (principal component analysis) and correlation analyses, gene expression data were normalized using the variance stabilizing transformation (VST) method implemented in DESeq2.
+
+Below, we present the PCA performed on the complete set of samples. PCA was used to explore global variance in gene expression profiles across all samples.
+
+The primary objectives of this analysis are to:
+
+- Assess sample quality
+
+- Determine whether samples cluster according to experimental conditions, suggesting biologically meaningful variation
+
+- Identify potential outliers
+
+- Detect batch effects or other sources of unwanted variation
+
+By reducing the high-dimensional gene expression data into a few principal components, PCA provides a visual summary of the dataset’s structure.
+
+```{r PCA_all, results="asis"}
+
+out <- preprocessing_PCA(counts, 
+    min_reads, 
+    sample_info, 
+    normalization = "vst",
+    min_sample = 5, 
+    design_formula = design_formula,
+    )
+
+rld <- out[["rld"]]
+
+colData(rld)$sample <- sample_info$sample
+colData(rld)$condition <- sample_info$condition
+
+p <- mypcaAnalysis_test(
+  title_1vs2 = "Analysis on all samples", 
+  rld = rld,
+  intgroup1 = "condition",
+  intgroup2 = "batch"
+)
+
+p
+```
+
+```{r batch_effect, results="asis", echo=FALSE}
+
+# n_batches <- length(unique(sample_info$batch))
+# var_threshold <- 0.1
+# pval_threshold <- 0.05
+
+# do_batch_correction <- FALSE  # default: no correction
+
+# if (n_batches > 1) {
+#   check <- check_batch_effect(rld, batch_var = "batch", cond_var = "condition_description", var_threshold = var_threshold)
+#   confound_check <- check_batch_condition_confounding(sample_info, batch_var = "batch", cond_var = "condition_description", pval_threshold = pval_threshold)
+  
+#   batch_var_exp_pct <- round(check$batch_var_exp * 100, 2)
+#   threshold_pct <- var_threshold * 100
+  
+#   warning_msg <- ""
+#   if (!is.null(confound_check$warning)) {
+#     warning_msg <- paste0(confound_check$warning, "<br><br>")
+#   }
+  
+#   if (confound_check$confounded) {
+#     batch_text <- paste0(
+#       "Samples come from ", n_batches, " different batches.<br><br>",
+#       "The independence test between batch and condition indicates a strong association (p-value = ",
+#       signif(confound_check$p_value, 3), ").<br>",
+#       "This suggests that batch and condition are confounded, and batch correction might remove true biological signal.<br><br>",
+#       "Therefore, batch correction <b>IS DISCOURAGED</b> to avoid introducing artifacts."
+#     )
+#     do_batch_correction <- FALSE
+    
+#   } else if (check$batch_significant) {
+#     batch_text <- paste0(
+#       "Samples come from ", n_batches, " different batches.<br>",
+#       "The variance explained by batch in the first two principal components is approximately <b>", batch_var_exp_pct, "%</b>, exceeding the threshold of <b>", threshold_pct, "%</b>.<br>",
+#       "Batch correction <b>IS SUGGESTED</b>."
+#     )
+#     do_batch_correction <- TRUE
+    
+#   } else {
+#     batch_text <- paste0(
+#       "Samples come from ", n_batches, " batches.<br>",
+#       "The variance explained by batch is low (", batch_var_exp_pct, "%), below the threshold of ", threshold_pct, "%.<br>",
+#       "Batch correction <b>IS DISCOURAGED</b> to preserve true biological signal."
+#     )
+#     do_batch_correction <- FALSE
+#   }
+  
+#   # Print output only if batch correction is suggested or there is a warning
+#   if (do_batch_correction || warning_msg != "") {
+#     cat("### Batch Effect Correction\n\n")
+#     cat(batch_text)
+#     cat("\n\n")
+#     cat(warning_msg)
+#   }
+  
+# } else {
+#   # Only one batch, no batch effect, no output
+#   do_batch_correction <- FALSE
+# }
+
+```
+
+<div style="color:red;">
+
+### Interpretation PCA Analysis and evaluation of batch effect
+
+Un bordello
+
+</div>
+
+## Correlation analysis
+
+The Spearman correlation heatmap provides a global view of the similarity between gene expression profiles across all samples.
+We calculated the pairwise Spearman correlation coefficients between samples and visualized them in a heatmap.
+Rows and columns are hierarchically clustered based on these correlations to reveal patterns of similarity and potential groupings among samples.
+
+```{r heatmap_metadata}
+sample_conditions <- as.data.frame(colData(dds)[, "condition", drop = FALSE])
+colnames(sample_conditions) <- "Condition"
+
+# Unique conditions
+conditions <- unique(as.character(colData(dds)$condition))
+n_conditions <- length(conditions)
+
+# Color palette
+palette_colors <- brewer.pal(min(n_conditions, 8), "Set2")
+palette_colors <- palette_colors[seq_len(n_conditions)]
+
+if (n_conditions > length(palette_colors)) {
+  palette_colors <- colorRampPalette(brewer.pal(8, "Set2"))(n_conditions)
+}
+
+# color mapping
+annotation_colors <- list(
+  Condition = setNames(palette_colors, conditions)
+)
+```
+
+```{r heatmap_correlation, results="asis",fig.height=12, fig.width=14}
+
+# Correlation between samples
+cor_matrix <- cor(assay(rld), method = "spearman")
+
+# Distance matrix defined as 1-correlation
+clustering_dist <- as.dist(1 - cor_matrix)
+```
+
+### **Spearman Correlation: General Interpretation**
+
+####  **High Correlation Values** (> 0.98)  
+*Between replicates of the same condition:*  
+
+  - A very good quality signal  
+
+  - Indicates that replicates behave consistently  
+
+  - Suggests well-defined and reproducible biological conditions  
+
+*Between different conditions:*  
+
+  - May indicate minor transcriptional differences  
+
+  - Or poor separation due to contamination or mislabeling
+
+#### **Lower Correlation Values** (< 0.95)  
+*Between replicates of the same condition:* 
+
+  - May suggest technical or biological issues:  
+
+    - Library prep/sequencing errors  
+
+    - Sample mix-up or mislabeling  
+
+    - Biological heterogeneity  
+
+In some cases, biological replicates may exhibit a certain degree of variability that cannot be entirely avoided. 
+This is particularly true when samples are obtained from different individuals, such as patient-derived samples, even when all other experimental conditions are carefully controlled.
+
+Therefore, lower correlation values between replicates should not be interpreted in a standardized way, but rather evaluated in the specific biological and experimental context of the study.
+
+*Between different conditions:*  
+
+  - Expected when conditions are biologically distinct  
+
+  - If correlations are too similar to replicates, it may suggest:  
+
+    - Weak treatment effects  
+
+    - Few genes affected by the condition  
+
+
+### Spearman Correlation Heatmap
+
+Below we present the heatmap associated spearman correlation.
+
+```{r heatmap_correlation_plot, fig.width=10, fig.height=10}
+
+pheatmap(
+  cor_matrix,
+  clustering_distance_rows = clustering_dist,
+  clustering_distance_cols = clustering_dist,
+  annotation_col = sample_conditions,
+  annotation_colors = annotation_colors,
+  main = "Sample-to-sample correlation (Spearman)",
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  fontsize_number = 7,
+  cellheight = 14,
+  cellwidth = 14
+)
+```
+
+<div style="color:red;">
+
+##### Interpretation Spearman Correlation Heatmap
+
+ongoing
+
+</div>
+
+#### Gene expression Heatmap, specific genes
+
+Below, we present a heatmap depicting the expression levels of the selected set of genes, filtered to include only those identified as differentially expressed (DEGs). 
+Consequently, the heatmap features genes from the selected list that overlap with the DEG subset. 
+Accompanying the heatmap is a table summarizing the differential expression analysis results for these genes. 
+Each gene is represented by multiple rows in the table, corresponding to the number of comparisons conducted.
+
+```{r heatmap_correlation_filtered, results="asis",fig.height=12, fig.width=14}
+
+list_genes <- read.csv(params$genelist1)[[1]]
+
+rld_filtered <- out_deseq2$rld[rownames(out_deseq2$rld) %in% list_genes, ]
+
+heat_out <- my_heatmaps(
+  deg = deg,
+  rld = rld_filtered,
+  title_1vs2 = "All_genes"
+)
+```
+
+```{r heatmap_correlation_plot_filtered, fig.width=10, fig.height=10}
+heat_out$h_all
+```
+
+```{r genes_table}
+res_filtered <- out_deseq2$res[out_deseq2$res$symbol %in% rownames(heat_out$expr_de_scaled), ]
+
+res_filtered <- res_filtered %>%
+  dplyr::select(gene, symbol, everything()) %>%
+  arrange(gene)
+
+datatable(
+    res_filtered,
+    extensions = 'Buttons',
+    options = list(
+      dom = 'Blfrtip',
+      buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+      lengthMenu = list(c(10, 25, 50, -1),
+                        c(10, 25, 50, "All"))
+    ),
+    rownames = FALSE,
+    caption = paste("List filtered genes")
+  )
+```
+
+<div style="color:red;">
+
+##### Gene expression Heatmap Heatmap
+
+ongoing
+
+</div>
+
+## Library Sizes
+
+A bar plot displaying total read counts per sample is shown below
+
+```{r counts_dds, results="asis", fig.width=8}
+
+lib_sizes <- data.frame(
+  sample_description = colData(dds)$sample,
+  total_counts = colSums(counts(dds))
+)
+
+# Plot
+ggplot(lib_sizes, aes(x = sample_description, y = total_counts)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "",
+       x = "Sample",
+       y = "Total Counts") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+<div style="color:red;">
+
+### Interpretation Library Sizes
+
+Variable but not extremely variable
+
+</div>
+
+## Violin plot of VST-normalized counts
+
+Below we present a violin plot of the VST-normalized read counts by sample.
+
+A violin plot of VST-normalized counts provides an overview of the global distribution of gene expression values across samples after normalization.  This plot allows for the detection of potential outliers, technical biases, or inconsistencies in distribution across samples, which could affect downstream analyses. A consistent distribution of VST counts across samples suggests successful normalization and comparable expression profiles.
+
+```{r violin_dds, results="asis", fig.width=8, fig.height=5}
+
+rld_matrix <- assay(rld)
+df_long <- reshape2::melt(rld_matrix, varnames = c("gene", "sample"), value.name = "expression")
+
+ggplot(df_long, aes(x = sample, y = expression)) +
+  geom_violin(trim = FALSE, fill = "#8da0cb", color = "black") +
+  geom_boxplot(width = 0.1, outlier.size = 0.5) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    y = "VST-normalized expression",
+    title = ""
+  )
+```
+
+<div style="color:red;">
+
+### Interpretation Violin plot of VST-normalized counts
+
+The violin plot of counts data displays a consistent distribution of VST counts across samples.  
+This indicates no substantial differences in gene expression profiles between the conditions and confirms the quality and reliability of the samples, supporting the inclusion of all samples in subsequent analyses.
+
+</div>
+
+### IFI6 counts
+
+Below we present the distribution of IFI6 normalised expression across conditions
+
+```{r}
+ifi6 = df_long[df_long$gene == "IFI6", ]
+ifi6$group <- unlist(lapply(strsplit(as.character(ifi6$sample), "_D"), "[[", 1))
+
+ggplot(ifi6, aes(x = group, y = expression)) +
+  geom_violin(trim = FALSE, fill = "#8da0cb", color = "black") +
+  geom_boxplot(width = 0.1, outlier.size = 0.5) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    y = "VST-normalized expression",
+    title = ""
+  )
+```
+
+## Average Expression across all samples
+
+Below we present the distributions of the selected genes expression across conditions in a barplot where the height of each bar represents the average expression of all the selected genes in that particular condition. Each condition includes all the available replicates except those already filtered. 
+
+```{r load_data}
+list1 <- read.csv(params$genelist1)[[1]]
+list2 <- read.csv(params$genelist2)[[1]]
+
+counts_matrix <- assay(dds, "counts")  # raw counts
+vst_matrix <- assay(dds, "vst") 
+```
+
+### Average Expression, Raw counts, gene list: shIFI6_vs_shIFI6
+
+```{r barplot1}
+count_matrix_subset1 <- counts_matrix[rownames(counts_matrix) %in% list1, ]
+
+conditions <- gsub("_rep[0-9]+$", "", colnames(count_matrix_subset1))
+t_mat <- t(count_matrix_subset1)
+summed_mat <- rowsum(t_mat, group = conditions)
+rep_counts <- table(conditions)
+mean_mat <- sweep(summed_mat, 1, rep_counts, FUN = "/")
+mean_mat <- t(mean_mat)
+mean_expr_per_sample <- colMeans(mean_mat)
+df <- data.frame(
+  sample = names(mean_expr_per_sample),
+  mean_expression = mean_expr_per_sample
+)
+
+# plot con ggplot2
+ggplot(df, aes(x = sample, y = mean_expression)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  xlab("Condition") +
+  ylab("Raw counts average gene expression") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Average Expression, Raw counts, gene list: shIFI6_vs_shSCR
+
+```{r barplot2}
+count_matrix_subset2 <- counts_matrix[rownames(counts_matrix) %in% list2, ]
+
+conditions <- gsub("_rep[0-9]+$", "", colnames(count_matrix_subset2))
+t_mat <- t(count_matrix_subset2)
+summed_mat <- rowsum(t_mat, group = conditions)
+rep_counts <- table(conditions)
+mean_mat <- sweep(summed_mat, 1, rep_counts, FUN = "/")
+mean_mat <- t(mean_mat)
+mean_expr_per_sample <- colMeans(mean_mat)
+df <- data.frame(
+  sample = names(mean_expr_per_sample),
+  mean_expression = mean_expr_per_sample
+)
+
+# plot con ggplot2
+ggplot(df, aes(x = sample, y = mean_expression)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  xlab("Condition") +
+  ylab("Raw counts average gene expression") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Average Expression, VST normalized counts, gene list: shIFI6_vs_shIFI6
+
+```{r barplot3}
+vst_matrix_subset1 <- vst_matrix[rownames(vst_matrix) %in% list1, ]
+
+conditions <- gsub("_rep[0-9]+$", "", colnames(vst_matrix_subset1))
+t_mat <- t(vst_matrix_subset1)
+summed_mat <- rowsum(t_mat, group = conditions)
+rep_counts <- table(conditions)
+mean_mat <- sweep(summed_mat, 1, rep_counts, FUN = "/")
+mean_mat <- t(mean_mat)
+mean_expr_per_sample <- colMeans(mean_mat)
+df <- data.frame(
+  sample = names(mean_expr_per_sample),
+  mean_expression = mean_expr_per_sample
+)
+
+# plot con ggplot2
+ggplot(df, aes(x = sample, y = mean_expression)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  xlab("Condition") +
+  ylab("VST normalized average gene expression") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Average Expression, VST normalized counts, gene list: shIFI6_vs_shSCR
+
+```{r barplot4}
+vst_matrix_subset2 <- vst_matrix[rownames(vst_matrix) %in% list2, ]
+
+conditions <- gsub("_rep[0-9]+$", "", colnames(vst_matrix_subset2))
+t_mat <- t(vst_matrix_subset2)
+summed_mat <- rowsum(t_mat, group = conditions)
+rep_counts <- table(conditions)
+mean_mat <- sweep(summed_mat, 1, rep_counts, FUN = "/")
+mean_mat <- t(mean_mat)
+mean_expr_per_sample <- colMeans(mean_mat)
+df <- data.frame(
+  sample = names(mean_expr_per_sample),
+  mean_expression = mean_expr_per_sample
+)
+
+# plot con ggplot2
+ggplot(df, aes(x = sample, y = mean_expression)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  xlab("Condition") +
+  ylab("VST normalized average gene expression") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
